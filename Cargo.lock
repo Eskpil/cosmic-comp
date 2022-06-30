@@ -328,6 +328,7 @@ dependencies = [
  "indexmap",
  "libsystemd",
  "ron",
+ "sendfd",
  "serde",
  "serde_json",
  "slog",
@@ -1311,6 +1312,15 @@ name = "scopeguard"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d29ab0c6d3fc0ee92fe66e2d99f700eab17a8d57d1c1d3b748380fb20baa78cd"
+
+[[package]]
+name = "sendfd"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc5d81e3352c1f4971e6e9d2c604fac7f5ecda6035a6b33e0fa1f89b90c7a852"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "serde"

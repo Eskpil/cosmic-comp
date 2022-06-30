@@ -6,7 +6,16 @@ use smithay::reexports::{
 };
 
 use anyhow::{Context, Result};
-use std::{ffi::OsString, sync::atomic::Ordering};
+use serde::{Serialize, Deserialize};
+use sendfd::RecvWithFd;
+use std::{
+    ffi::OsString,
+    os::unix::{
+        io::{FromRawFd, AsRawFd, RawFd},
+        net::UnixStream,
+    },
+    sync::atomic::Ordering,
+};
 
 pub mod backend;
 pub mod config;
@@ -20,6 +29,29 @@ pub mod wayland;
 
 #[cfg(feature = "debug")]
 pub mod debug;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "message")]
+pub enum Message {
+	SetEnv { variables: std::collections::HashMap<String, String> },
+	NewPrivilegedClient { count: usize },
+}
+
+struct StreamWrapper {
+    reader: std::io::BufReader<UnixStream>,
+}
+impl AsRawFd for StreamWrapper {
+    fn as_raw_fd(&self) -> RawFd {
+        self.reader.get_ref().as_raw_fd()
+    }
+}
+impl From<UnixStream> for StreamWrapper {
+    fn from(stream: UnixStream) -> StreamWrapper {
+        StreamWrapper {
+            reader: std::io::BufReader::new(stream),
+        }
+    }
+}
 
 fn main() -> Result<()> {
     // setup logger
@@ -43,6 +75,51 @@ fn main() -> Result<()> {
     backend::init_backend_auto(&mut event_loop, &mut state)?;
     // potentially tell systemd we are setup now
     systemd::ready(&state);
+
+    if let Ok(fd_num) = std::env::var("COSMIC_SESSION_SOCK") {
+        if let Ok(fd) = fd_num.parse::<RawFd>() {
+            let session_socket = unsafe { UnixStream::from_raw_fd(fd) };
+            event_loop.handle().insert_source(
+                Generic::new(StreamWrapper::from(session_socket), Interest::READ, Mode::Level),
+                move |_, stream, state: &mut state::State| {
+                    use std::io::BufRead;
+
+                    let mut line = String::new();
+                    match stream.reader.read_line(&mut line) {
+                        Ok(x) if x > 0 => {
+                            match serde_json::from_str::<'_, Message>(&line) {
+                                Ok(Message::NewPrivilegedClient { count }) => {
+                                    let mut buffer = [0; 1];
+                                    let mut fds = vec![0; count];
+                                    match stream.reader.get_mut().recv_with_fd(&mut buffer, &mut *fds) {
+                                        Ok((_, received_count)) => {
+                                            assert_eq!(received_count, count);
+                                            for fd in fds.into_iter().take(received_count) {
+                                                let display = state.common.display.clone();
+                                                unsafe { display.borrow_mut().create_client(fd, state) };
+                                            }
+                                        },
+                                        Err(err) => {
+                                            slog_scope::warn!("Failed to read file descriptors from session sock: {}", err);
+                                        }
+                                    }
+                                },
+                                Ok(Message::SetEnv { .. }) => slog_scope::warn!("Got SetEnv from session? What is this?"),
+                                _ => slog_scope::warn!("Unknown session socket message, are you using incompatible cosmic-session and cosmic-comp versions?"),
+                            };
+                            Ok(PostAction::Continue)
+                        },
+                        Ok(_) => Ok(PostAction::Disable),
+                        Err(err) => {
+                            slog_scope::warn!("Error reading from session socket: {}", err);
+                            Ok(PostAction::Remove)
+                        },
+                    }
+                },
+            ).with_context(|| "Failed to init the cosmic session socket source")?;
+        }
+        slog_scope::error!("COSMIC_SESSION_SOCK is no valid RawFd: {}", fd_num);
+    };
 
     // run the event loop
     event_loop.run(None, &mut state, |state| {
